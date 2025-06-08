@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Neon Runner</title>
+    <title>Neon Runner Enhanced</title>
     <style>
         body {
             margin: 0;
@@ -27,6 +27,8 @@
             padding: 20px;
             margin-top: 20px;
             position: relative;
+            max-width: 95vw;
+            overflow: hidden;
         }
         
         #gameCanvas {
@@ -34,6 +36,8 @@
             background: linear-gradient(180deg, #001122, #003344, #001122);
             display: block;
             box-shadow: 0 0 20px #00ffff;
+            max-width: 100%;
+            height: auto;
         }
         
         .hud {
@@ -80,6 +84,9 @@
         @media (max-width: 768px) {
             .touch-controls {
                 display: flex;
+            }
+            .controls {
+                display: none;
             }
         }
         
@@ -180,10 +187,10 @@
             <div class="level">Level: <span id="level">1</span></div>
         </div>
         
-        <canvas id="gameCanvas" width="900" height="500"></canvas>
+        <canvas id="gameCanvas" width="800" height="400"></canvas>
         
         <div class="controls">
-            A/D or ←/→ to move • W or ↑ to jump • S or ↓ to slide • Avoid obstacles and collect orbs!
+            Hold W/↑/Space to charge jump (longer = higher!), release to launch! • A/D or ←/→ to move • S or ↓ to slide
         </div>
         
         <div class="touch-controls">
@@ -210,14 +217,18 @@
 
     <script>
         // Game constants
-        const CANVAS_WIDTH = 900;
-        const CANVAS_HEIGHT = 500;
+        const CANVAS_WIDTH = 800;
+        const CANVAS_HEIGHT = 400;
         const WORLD_WIDTH = 5000;
         const GRAVITY = 0.8;
-        const JUMP_FORCE = -15;
+        const MAX_JUMP_FORCE = -25; // Maximum possible jump force
+        const MIN_JUMP_FORCE = -8;  // Minimum jump force
+        const JUMP_CHARGE_RATE = 0.3; // How fast jump power builds up
         const PLAYER_SPEED = 5;
         const SCROLL_SPEED = 4;
         const MAX_PARTICLES = 100;
+        const COYOTE_TIME = 8; // frames
+        const JUMP_BUFFER_TIME = 8; // frames
         
         // Game elements
         const canvas = document.getElementById('gameCanvas');
@@ -238,7 +249,7 @@
         // Game objects
         const player = {
             x: 100,
-            y: CANVAS_HEIGHT - 150,
+            y: CANVAS_HEIGHT - 120,
             width: 30,
             height: 40,
             velocityY: 0,
@@ -246,7 +257,14 @@
             onGround: false,
             sliding: false,
             slideTimer: 0,
-            wasOnGround: false
+            wasOnGround: false,
+            coyoteTime: 0,
+            jumpBufferTime: 0,
+            isJumping: false,
+            jumpHoldTime: 0,
+            jumpCharge: 0,        // Current jump charge amount
+            isCharging: false,    // Whether currently charging a jump
+            wasJumpPressed: false // Track previous jump state
         };
         
         let platforms = [];
@@ -326,19 +344,19 @@
                 });
             }
             
-            // Floating platforms
-            for (let x = 200; x < WORLD_WIDTH - 500; x += 300 + Math.random() * 200) {
+            // Floating platforms with better spacing
+            for (let x = 200; x < WORLD_WIDTH - 500; x += 250 + Math.random() * 150) {
                 platforms.push({
                     x: x,
-                    y: CANVAS_HEIGHT - 150 - Math.random() * 200,
+                    y: CANVAS_HEIGHT - 150 - Math.random() * 180,
                     width: 80 + Math.random() * 40,
                     height: 20,
                     type: 'platform'
                 });
             }
             
-            // Obstacles
-            for (let x = 300; x < WORLD_WIDTH - 500; x += 200 + Math.random() * 300) {
+            // Obstacles with better placement
+            for (let x = 400; x < WORLD_WIDTH - 500; x += 180 + Math.random() * 250) {
                 obstacles.push({
                     x: x,
                     y: CANVAS_HEIGHT - 100,
@@ -349,28 +367,40 @@
             }
             
             // Collectibles
-            for (let x = 250; x < WORLD_WIDTH - 500; x += 150 + Math.random() * 200) {
+            for (let x = 250; x < WORLD_WIDTH - 500; x += 120 + Math.random() * 180) {
                 collectibles.push({
                     x: x,
-                    y: CANVAS_HEIGHT - 200 - Math.random() * 150,
+                    y: CANVAS_HEIGHT - 180 - Math.random() * 120,
                     width: 15,
                     height: 15,
                     collected: false,
-                    pulse: 0
+                    pulse: Math.random() * Math.PI * 2
                 });
             }
         }
         
         // Input handling
         document.addEventListener('keydown', (e) => {
-            keys[e.key.toLowerCase()] = true;
-            if (e.key === ' ' || e.key === 'Spacebar') {
+            const key = e.key.toLowerCase();
+            keys[key] = true;
+            
+            // Handle spacebar specifically
+            if (e.code === 'Space' || key === ' ') {
+                keys[' '] = true;
+                keys['space'] = true;
                 e.preventDefault();
             }
         });
         
         document.addEventListener('keyup', (e) => {
-            keys[e.key.toLowerCase()] = false;
+            const key = e.key.toLowerCase();
+            keys[key] = false;
+            
+            // Handle spacebar specifically
+            if (e.code === 'Space' || key === ' ') {
+                keys[' '] = false;
+                keys['space'] = false;
+            }
         });
         
         function isMovingLeft() {
@@ -381,8 +411,8 @@
             return keys['d'] || keys['arrowright'] || touchControls['rightBtn'];
         }
         
-        function isJumping() {
-            return keys['w'] || keys['arrowup'] || keys[' '] || touchControls['jumpBtn'];
+        function isJumpPressed() {
+            return keys['w'] || keys['arrowup'] || keys[' '] || keys['space'] || touchControls['jumpBtn'];
         }
         
         function isSliding() {
@@ -413,44 +443,14 @@
                    rect1.y + rect1.height > rect2.y;
         }
         
-        function resolveCollision(player, platform) {
-            const overlapLeft = (player.x + player.width) - platform.x;
-            const overlapRight = (platform.x + platform.width) - player.x;
-            const overlapTop = (player.y + player.height) - platform.y;
-            const overlapBottom = (platform.y + platform.height) - player.y;
-            
-            const minOverlapX = Math.min(overlapLeft, overlapRight);
-            const minOverlapY = Math.min(overlapTop, overlapBottom);
-            
-            // Resolve collision based on smallest overlap
-            if (minOverlapX < minOverlapY) {
-                // Horizontal collision
-                if (overlapLeft < overlapRight) {
-                    player.x = platform.x - player.width;
-                } else {
-                    player.x = platform.x + platform.width;
-                }
-                player.velocityX = 0;
-            } else {
-                // Vertical collision
-                if (overlapTop < overlapBottom) {
-                    // Landing on top
-                    player.y = platform.y - player.height;
-                    player.velocityY = 0;
-                    player.onGround = true;
-                } else {
-                    // Hitting from below
-                    player.y = platform.y + platform.height;
-                    player.velocityY = 0;
-                }
-            }
-        }
-        
         function update() {
             if (!gameRunning) return;
             
             // Store previous ground state
             player.wasOnGround = player.onGround;
+            
+            // Get current jump input state
+            const jumpPressed = isJumpPressed();
             
             // Update invulnerability
             if (invulnerable) {
@@ -473,15 +473,84 @@
             player.x += player.velocityX;
             player.x = Math.max(0, Math.min(player.x, WORLD_WIDTH - player.width));
             
-            // Jumping
-            if (isJumping() && player.onGround) {
-                player.velocityY = JUMP_FORCE;
-                player.onGround = false;
-                // Jump particles
-                for (let i = 0; i < 5; i++) {
-                    createParticle(player.x + player.width/2, player.y + player.height, colors.player, 0, 2);
+            // Coyote time - allow jumping for a few frames after leaving ground
+            if (player.wasOnGround && !player.onGround && player.velocityY >= 0) {
+                player.coyoteTime = COYOTE_TIME;
+            }
+            if (player.coyoteTime > 0) player.coyoteTime--;
+            
+            // Jump buffer - remember jump input for a few frames
+            if (jumpPressed && !player.wasJumpPressed) {
+                player.jumpBufferTime = JUMP_BUFFER_TIME;
+            }
+            if (player.jumpBufferTime > 0) player.jumpBufferTime--;
+            
+            // Jump charging system - only when grounded or in coyote time
+            const canCharge = player.onGround || player.coyoteTime > 0;
+            
+            // Start charging when jump is pressed and player can jump
+            if (jumpPressed && !player.wasJumpPressed && canCharge && !player.isCharging) {
+                player.isCharging = true;
+                player.jumpCharge = 0;
+            }
+            
+            // Build up jump charge while holding
+            if (player.isCharging && jumpPressed && canCharge) {
+                player.jumpCharge += JUMP_CHARGE_RATE;
+                const maxCharge = Math.abs(MAX_JUMP_FORCE - MIN_JUMP_FORCE);
+                player.jumpCharge = Math.min(player.jumpCharge, maxCharge);
+                
+                // Create charging particles
+                if (Math.random() < 0.3) {
+                    createParticle(
+                        player.x + player.width/2 + (Math.random() - 0.5) * player.width,
+                        player.y + player.height,
+                        player.jumpCharge >= maxCharge ? '#ff00ff' : '#ffff00',
+                        (Math.random() - 0.5) * 2,
+                        -Math.random() * 3
+                    );
                 }
             }
+            
+            // Release jump when button is let go OR use jump buffer
+            const shouldJump = (player.isCharging && !jumpPressed && player.wasJumpPressed) || 
+                             (player.jumpBufferTime > 0 && canCharge && !player.isCharging);
+            
+            if (shouldJump) {
+                let jumpForce;
+                if (player.isCharging) {
+                    jumpForce = MIN_JUMP_FORCE - player.jumpCharge;
+                } else {
+                    jumpForce = MIN_JUMP_FORCE; // Default jump for buffer system
+                }
+                
+                player.velocityY = jumpForce;
+                player.onGround = false;
+                player.coyoteTime = 0;
+                player.jumpBufferTime = 0;
+                player.isCharging = false;
+                player.jumpCharge = 0;
+                
+                // Jump particles
+                const particleCount = Math.min(15, 5 + Math.floor(Math.abs(jumpForce) / 2));
+                for (let i = 0; i < particleCount; i++) {
+                    createParticle(
+                        player.x + player.width/2,
+                        player.y + player.height,
+                        Math.abs(jumpForce) > 15 ? '#00ffff' : colors.player,
+                        (Math.random() - 0.5) * 6,
+                        Math.random() * 4 + 2
+                    );
+                }
+            }
+            
+            // Cancel charging if player loses ability to jump
+            if (player.isCharging && !canCharge) {
+                player.isCharging = false;
+                player.jumpCharge = 0;
+            }
+            
+            player.wasJumpPressed = jumpPressed;
             
             // Sliding
             if (isSliding() && player.onGround) {
@@ -495,8 +564,12 @@
                 player.sliding = false;
             }
             
-            // Apply gravity
+            // Apply gravity (normal gravity always)
             player.velocityY += GRAVITY;
+            
+            // Terminal velocity
+            player.velocityY = Math.min(player.velocityY, 20);
+            
             player.y += player.velocityY;
             
             // Reset ground state
@@ -510,17 +583,45 @@
                 height: player.sliding ? player.height / 2 : player.height
             };
             
-            // Platform collision with improved detection
-            for (let platform of platforms) {
+            // Platform collision with improved detection and optimization
+            const playerCenterX = player.x + player.width / 2;
+            const nearbyPlatforms = platforms.filter(platform => 
+                Math.abs(platform.x + platform.width/2 - playerCenterX) < 200
+            );
+            
+            for (let platform of nearbyPlatforms) {
                 if (checkCollision(playerCollisionBox, platform)) {
-                    // Only resolve collision if player was above platform
-                    if (player.velocityY > 0 && player.y < platform.y) {
-                        player.y = platform.y - (player.sliding ? player.height / 2 : player.height);
-                        player.velocityY = 0;
-                        player.onGround = true;
+                    // Calculate overlap amounts
+                    const overlapLeft = (playerCollisionBox.x + playerCollisionBox.width) - platform.x;
+                    const overlapRight = (platform.x + platform.width) - playerCollisionBox.x;
+                    const overlapTop = (playerCollisionBox.y + playerCollisionBox.height) - platform.y;
+                    const overlapBottom = (platform.y + platform.height) - playerCollisionBox.y;
+                    
+                    // Find minimum overlap
+                    const minOverlapX = Math.min(overlapLeft, overlapRight);
+                    const minOverlapY = Math.min(overlapTop, overlapBottom);
+                    
+                    // Always resolve collision - removed arbitrary threshold
+                    if (minOverlapY < minOverlapX) {
+                        // Vertical collision
+                        if (overlapTop < overlapBottom && player.velocityY > 0) {
+                            // Landing on top
+                            player.y = platform.y - (player.sliding ? player.height / 2 : player.height);
+                            player.velocityY = 0;
+                            player.onGround = true;
+                        } else if (overlapBottom < overlapTop && player.velocityY < 0) {
+                            // Hitting from below
+                            player.y = platform.y + platform.height - (player.sliding ? player.height / 2 : 0);
+                            player.velocityY = 0;
+                        }
                     } else {
-                        // Side or ceiling collision
-                        resolveCollision(playerCollisionBox, platform);
+                        // Horizontal collision
+                        if (overlapLeft < overlapRight) {
+                            player.x = platform.x - player.width;
+                        } else {
+                            player.x = platform.x + platform.width;
+                        }
+                        player.velocityX = 0;
                     }
                 }
             }
@@ -529,9 +630,13 @@
             const targetCameraX = Math.max(0, Math.min(player.x - CANVAS_WIDTH / 3, WORLD_WIDTH - CANVAS_WIDTH));
             cameraX += (targetCameraX - cameraX) * 0.1;
             
-            // Obstacle collision
+            // Obstacle collision (only check nearby obstacles for performance)
             if (!invulnerable) {
-                for (let obstacle of obstacles) {
+                const nearbyObstacles = obstacles.filter(obstacle => 
+                    Math.abs(obstacle.x + obstacle.width/2 - playerCenterX) < 150
+                );
+                
+                for (let obstacle of nearbyObstacles) {
                     if (checkCollision(playerCollisionBox, obstacle)) {
                         health--;
                         document.getElementById('health').textContent = health;
@@ -553,10 +658,9 @@
             }
             
             // Collectible collision (only check nearby collectibles for performance)
-            const playerCenterX = player.x + player.width / 2;
             for (let collectible of collectibles) {
                 if (!collectible.collected && 
-                    Math.abs(collectible.x - playerCenterX) < 200 && // Only check nearby
+                    Math.abs(collectible.x - playerCenterX) < 100 && // Reduced search radius
                     checkCollision(playerCollisionBox, collectible)) {
                     
                     collectible.collected = true;
@@ -573,7 +677,7 @@
             // Update collectibles (only visible ones)
             for (let collectible of collectibles) {
                 if (Math.abs(collectible.x - cameraX) < CANVAS_WIDTH + 200) {
-                    collectible.pulse += 0.2;
+                    collectible.pulse += 0.15;
                 }
             }
             
@@ -698,13 +802,32 @@
                 }
             }
             
-            // Draw player
+            // Draw player with charging effect
             const playerHeight = player.sliding ? player.height / 2 : player.height;
             const playerY = player.sliding ? player.y + player.height / 2 : player.y;
             
             // Player flashing when invulnerable
             if (!invulnerable || Math.floor(invulnerabilityTimer / 5) % 2) {
-                ctx.fillStyle = colors.player;
+                // Player glow intensity based on jump charge
+                let glowIntensity = 15;
+                let playerColor = colors.player;
+                
+                if (player.isCharging) {
+                    const chargeRatio = player.jumpCharge / Math.abs(MAX_JUMP_FORCE - MIN_JUMP_FORCE);
+                    glowIntensity = 15 + chargeRatio * 25;
+                    // Change color as charge builds up
+                    if (chargeRatio >= 1.0) {
+                        playerColor = '#ff00ff'; // Magenta for max charge
+                        // Add pulsing effect at max charge
+                        glowIntensity += Math.sin(Date.now() * 0.01) * 10;
+                    } else if (chargeRatio > 0.7) {
+                        playerColor = '#ff8800'; // Orange for high charge
+                    } else if (chargeRatio > 0.4) {
+                        playerColor = '#ffff00'; // Yellow for medium charge
+                    }
+                }
+                
+                ctx.fillStyle = playerColor;
                 ctx.fillRect(player.x, playerY, player.width, playerHeight);
                 
                 // Player details
@@ -717,8 +840,8 @@
                 }
                 
                 // Player glow
-                ctx.shadowColor = colors.player;
-                ctx.shadowBlur = 15;
+                ctx.shadowColor = playerColor;
+                ctx.shadowBlur = glowIntensity;
                 ctx.fillRect(player.x, playerY, player.width, playerHeight);
                 ctx.shadowBlur = 0;
             }
@@ -750,13 +873,20 @@
             
             // Reset player
             player.x = 100;
-            player.y = CANVAS_HEIGHT - 150;
+            player.y = CANVAS_HEIGHT - 120;
             player.velocityY = 0;
             player.velocityX = 0;
             player.onGround = false;
             player.sliding = false;
             player.slideTimer = 0;
             player.wasOnGround = false;
+            player.coyoteTime = 0;
+            player.jumpBufferTime = 0;
+            player.isJumping = false;
+            player.jumpHoldTime = 0;
+            player.jumpCharge = 0;
+            player.isCharging = false;
+            player.wasJumpPressed = false;
             
             // Clear arrays
             particles.length = 0;
